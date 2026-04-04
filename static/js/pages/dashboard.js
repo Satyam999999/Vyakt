@@ -14,6 +14,7 @@
     let predictionInterval;
     let currentAudio = null;
     let lastSpoken = "";
+    let stopInProgress = false;
 
     function hideLivePrediction() {
         predictedText.innerText = "";
@@ -40,11 +41,16 @@
             .catch(() => {});
     }
 
-    startCameraButton.addEventListener('click', () => {
+    startCameraButton.addEventListener('click', async () => {
+        try {
+            await fetch('/reset_capture_state', { method: 'POST' });
+        } catch {}
+
         const feedUrl = startCameraButton.getAttribute('data-feed-url');
 
         cameraFeedContainer.style.display = 'block';
         cameraFeed.src = feedUrl;
+        finalText.innerText = '';
 
         startCameraButton.style.display = 'none';
         closeCameraButton.style.display = 'inline-flex';
@@ -112,6 +118,12 @@
     });
 
     stopCapture.addEventListener('click', async () => {
+        if (stopInProgress) {
+            return;
+        }
+        stopInProgress = true;
+        stopCapture.disabled = true;
+
         const res = await fetch('/stop_capture', { method: 'POST' });
         const data = await res.json();
 
@@ -126,5 +138,6 @@
 
         startCapture.disabled = false;
         stopCapture.disabled = true;
+        stopInProgress = false;
     });
 });
