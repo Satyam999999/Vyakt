@@ -28,6 +28,8 @@ camera_lock = threading.Lock()
 latest_prediction = {"text": "", "confidence": 0.0, "state": "idle"}
 captured_sequence = []
 is_capturing = False
+capture_session_id = 0
+last_capture_result = None
 from Model.features import (
     FEATURE_SIZE,
     SEQUENCE_LENGTH,
@@ -48,9 +50,36 @@ app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev_secret_key')
 
 # MongoDB Configuration
-mongo_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
-mongo_client = MongoClient(mongo_uri)
-db = mongo_client['vyakt_db']
+mongo_client = None
+db = None
+MONGO_AVAILABLE = False
+
+
+def _init_mongo():
+    mongo_db_name = os.getenv('MONGO_DB_NAME', 'vyakt_db').strip() or 'vyakt_db'
+    primary_uri = os.getenv('MONGO_URI', 'mongodb://localhost:27017/').strip()
+    fallback_uri = os.getenv('MONGO_URI_FALLBACK', 'mongodb://localhost:27017/').strip()
+    candidate_uris = [uri for uri in dict.fromkeys([primary_uri, fallback_uri]) if uri]
+
+    for uri in candidate_uris:
+        try:
+            client = MongoClient(
+                uri,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=5000,
+                socketTimeoutMS=5000,
+            )
+            client.admin.command('ping')
+            app.logger.info("MongoDB connected: %s", uri)
+            return client, client[mongo_db_name], True
+        except Exception as exc:
+            app.logger.warning("MongoDB connection failed for uri='%s': %s", uri, exc)
+
+    app.logger.error("MongoDB unavailable. App will continue with limited DB-dependent features.")
+    return None, None, False
+
+
+mongo_client, db, MONGO_AVAILABLE = _init_mongo()
 app.config['GOOGLE_TRANSLATE_API_KEY'] = os.getenv('GOOGLE_TRANSLATE_API_KEY', '')
 
 
@@ -307,6 +336,8 @@ def _compute_next_streak(previous_streak, last_activity_day):
 
 
 def _get_learning_progress(user_key):
+    if not MONGO_AVAILABLE or db is None:
+        return _default_learning_progress()
     progress = db.learning_progress.find_one({'user_key': user_key}, {'_id': 0, 'user_key': 0})
     base = _default_learning_progress()
     if progress:
@@ -315,12 +346,17 @@ def _get_learning_progress(user_key):
 
 
 def _save_learning_progress(user_key, payload):
+    if not MONGO_AVAILABLE or db is None:
+        return
     payload = dict(payload)
     payload['updated_at'] = _utc_now()
     db.learning_progress.update_one({'user_key': user_key}, {'$set': payload}, upsert=True)
 
 
 def _ensure_learning_indexes_and_seed_data():
+    if not MONGO_AVAILABLE or db is None:
+        app.logger.warning("Skipping learning index setup because MongoDB is unavailable.")
+        return
     db.learning_progress.create_index('user_key', unique=True, name='learning_progress_user_key_unique')
     db.learning_progress.create_index('xp', name='learning_progress_xp_idx')
 
@@ -379,8 +415,8 @@ def _build_fallback_memory_tips(incorrect_items):
 
 
 def _gemini_memory_tips(incorrect_items, lesson_context):
-    api_key = os.getenv('GEMINI_API_KEY', '').strip()
-    gemini_text_model = os.getenv('GEMINI_TEXT_MODEL', 'gemini-1.5-flash').strip()
+    api_key = _get_gemini_api_key()
+    gemini_text_model = _get_gemini_model_name()
     if not api_key or not incorrect_items:
         return _build_fallback_memory_tips(incorrect_items)
 
@@ -417,7 +453,7 @@ def _gemini_memory_tips(incorrect_items, lesson_context):
 
     try:
         response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1/models/{gemini_text_model}:generateContent?key={api_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_text_model}:generateContent?key={api_key}",
             json=payload,
             timeout=12,
         )
@@ -506,79 +542,186 @@ def _asset_for_word(word):
     return f"static/assets/{stem}.mp4"
 
 
+_GEMINI_MODEL_CACHE: dict[str, list[tuple[str, str]]] = {}
+
+
+def _get_gemini_api_key() -> str:
+    # Support both env names used across Gemini docs/examples.
+    return (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
+
+
+def _get_gemini_model_name() -> str:
+    return (
+        os.getenv("GEMINI_TEXT_MODEL", "")
+        or os.getenv("GEMINI_MODEL", "")
+        or "gemini-3-flash-preview"
+    ).strip()
+
+
+def _discover_gemini_generate_models(api_key: str) -> list[tuple[str, str]]:
+    cache_key = (api_key or "").strip()[:12]
+    if cache_key in _GEMINI_MODEL_CACHE:
+        return _GEMINI_MODEL_CACHE[cache_key]
+
+    discovered: list[tuple[str, str]] = []
+    for api_version in ("v1beta", "v1"):
+        url = f"https://generativelanguage.googleapis.com/{api_version}/models?key={api_key}"
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            for model in payload.get("models", []):
+                full_name = str(model.get("name", ""))
+                methods = model.get("supportedGenerationMethods", []) or []
+                if "generateContent" not in methods:
+                    continue
+                if not full_name.startswith("models/"):
+                    continue
+                model_name = full_name.split("/", 1)[1]
+                if model_name:
+                    discovered.append((api_version, model_name))
+        except Exception as exc:
+            app.logger.warning(
+                "Gemini model discovery failed for api='%s': %s",
+                api_version,
+                exc,
+            )
+
+    # Deduplicate while preserving order.
+    deduped = list(dict.fromkeys(discovered))
+    _GEMINI_MODEL_CACHE[cache_key] = deduped
+    if deduped:
+        app.logger.info("Gemini discovered models: %s", [f"{a}:{m}" for a, m in deduped[:8]])
+    return deduped
+
+
 def correct_sentence_with_gemini(sentence: str) -> str:
+    def _local_cleanup(text: str) -> str:
+        tokens = [t for t in str(text).strip().split() if t]
+        if not tokens:
+            return ""
+
+        lowered = [t.lower() for t in tokens]
+        greetings = {"hello", "hi", "hey"}
+        positives = {"good", "great", "nice"}
+
+        if len(lowered) == 2 and lowered[0] in positives and lowered[1] in greetings:
+            return f"{tokens[1].capitalize()}, {tokens[0].lower()} to see you."
+        if len(lowered) == 2 and lowered[0] in greetings and lowered[1] in positives:
+            return f"{tokens[0].capitalize()}, {tokens[1].lower()} to see you."
+
+        cleaned = " ".join(tokens)
+        cleaned = cleaned[0].upper() + cleaned[1:] if cleaned else cleaned
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+        return cleaned
+
     clean_sentence = str(sentence or "").strip()
     if not clean_sentence:
         app.logger.info("Gemini correction skipped: empty sentence.")
         return ""
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = _get_gemini_api_key()
     if not api_key:
-        app.logger.warning("Gemini correction skipped: GEMINI_API_KEY is not set.")
+        app.logger.warning("Gemini correction skipped: GEMINI_API_KEY/GOOGLE_API_KEY is not set.")
         return clean_sentence
 
-    model_name = os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-flash").strip() or "gemini-1.5-flash"
+    configured_model = _get_gemini_model_name()
+    discovered_models = _discover_gemini_generate_models(api_key)
 
-    try:
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": (
-                                "You are a grammar and fluency editor for sign-language-to-text output.\n"
-                                "Rewrite the text into one clean, natural English sentence.\n"
-                                "You may reorder words if needed, but keep the original meaning.\n"
-                                "Do not return the exact input if it is not grammatical.\n"
-                                "Return only the corrected sentence, no explanation.\n"
-                                f"Input: {clean_sentence}"
-                            )
-                        }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 120,
-            },
-        }
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={api_key}",
-            json=payload,
-            timeout=12,
-        )
-        response.raise_for_status()
-        data = response.json()
-        corrected = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-            .strip()
-        )
-        if corrected:
-            app.logger.info(
-                "Gemini correction success | input='%s' | output='%s' | model='%s'",
-                clean_sentence,
-                corrected,
-                model_name,
-            )
-            return corrected
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": (
+                            "You are improving sign-language token output into natural English.\n"
+                            "Task: produce exactly one meaningful, grammatically correct sentence.\n"
+                            "Rules:\n"
+                            "1) Keep the likely intended meaning.\n"
+                            "2) Reorder words, add minimal helper words, and remove repeated fillers.\n"
+                            "3) Output must be a full sentence (at least 3 words) ending with punctuation.\n"
+                            "4) Do not output explanations or multiple options.\n"
+                            f"Input tokens: {clean_sentence}\n"
+                            "Final sentence:"
+                        )
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 80,
+        },
+    }
 
-        app.logger.warning(
-            "Gemini correction empty output; using original sentence. input='%s' model='%s'",
-            clean_sentence,
-            model_name,
-        )
-        return clean_sentence
-    except Exception as exc:
-        app.logger.exception(
-            "Gemini correction failed; using original sentence. input='%s' model='%s' error='%s'",
-            clean_sentence,
-            model_name,
-            exc,
-        )
-        return clean_sentence
+    attempts: list[tuple[str, str]] = []
+    preferred_discovered = [
+        item for item in discovered_models
+        if item[0] == "v1beta" and item[1] in {"gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-001"}
+    ]
+    remaining_discovered = [item for item in discovered_models if item not in preferred_discovered and item[0] == "v1beta"]
+    attempts.extend(preferred_discovered)
+    attempts.extend(remaining_discovered)
+    # If discovery fails, still try configured/default model on v1beta.
+    attempts.append(("v1beta", configured_model))
+    attempts.append(("v1beta", "gemini-3-flash-preview"))
+    attempts = list(dict.fromkeys(attempts))
+
+    for api_version, gemini_text_model in attempts:
+            try:
+                url = (
+                    f"https://generativelanguage.googleapis.com/"
+                    f"{api_version}/models/{gemini_text_model}:generateContent?key={api_key}"
+                )
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=8,
+                )
+                response.raise_for_status()
+                data = response.json()
+                corrected = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    .strip()
+                )
+                corrected = corrected.replace("\n", " ").strip(" \"'")
+
+                if corrected:
+                    if corrected.lower() == clean_sentence.lower():
+                        corrected = _local_cleanup(clean_sentence)
+                    app.logger.info(
+                        "Gemini correction success | input='%s' | output='%s' | model='%s' | api='%s'",
+                        clean_sentence,
+                        corrected,
+                        gemini_text_model,
+                        api_version,
+                    )
+                    return corrected
+
+                app.logger.warning(
+                    "Gemini correction empty output; trying fallback. input='%s' model='%s' api='%s'",
+                    clean_sentence,
+                    gemini_text_model,
+                    api_version,
+                )
+            except Exception as exc:
+                app.logger.warning(
+                    "Gemini correction failed; trying fallback. input='%s' model='%s' api='%s' error='%s'",
+                    clean_sentence,
+                    gemini_text_model,
+                    api_version,
+                    exc,
+                )
+
+    app.logger.error(
+        "Gemini correction exhausted all models; using original sentence. input='%s'",
+        clean_sentence,
+    )
+    return _local_cleanup(clean_sentence)
 
 
 def _augment_quiz_questions(lesson, quiz):
@@ -1556,6 +1699,17 @@ def get_prediction():
     return jsonify(latest_prediction)
 
 
+@app.route('/reset_capture_state', methods=['POST'])
+def reset_capture_state():
+    global captured_sequence, is_capturing, latest_prediction, capture_session_id, last_capture_result
+    captured_sequence = []
+    is_capturing = False
+    latest_prediction = {"text": "", "confidence": 0.0, "state": "idle"}
+    capture_session_id += 1
+    last_capture_result = None
+    return jsonify({"status": "reset", "capture_session_id": capture_session_id})
+
+
 def _build_sentence_from_gesture_tokens(tokens):
     cleaned_tokens = [str(token).strip() for token in tokens if str(token).strip()]
     if not cleaned_tokens:
@@ -1574,34 +1728,43 @@ def _build_sentence_from_gesture_tokens(tokens):
 
 @app.route('/start_capture', methods=['POST'])
 def start_capture():
-    global captured_sequence, is_capturing, latest_prediction
+    global captured_sequence, is_capturing, latest_prediction, capture_session_id, last_capture_result
     captured_sequence = []
     is_capturing = True
     latest_prediction = {"text": "", "confidence": 0.0, "state": "idle"}
-    return jsonify({"status": "started"})
+    capture_session_id += 1
+    last_capture_result = None
+    return jsonify({"status": "started", "capture_session_id": capture_session_id})
 
 @app.route('/stop_capture', methods=['POST'])
 def stop_capture():
-    global captured_sequence, is_capturing
+    global captured_sequence, is_capturing, last_capture_result, capture_session_id
 
     is_capturing = False
 
+    if last_capture_result is not None and last_capture_result.get("capture_session_id") == capture_session_id:
+        return jsonify(last_capture_result)
+
     if not captured_sequence:
-        return jsonify({
+        result = {
             "sequence": [],
             "combined": "",
             "words": "No input detected"
-        })
+        }
+        last_capture_result = {**result, "capture_session_id": capture_session_id}
+        return jsonify(last_capture_result)
 
     combined, words = _build_sentence_from_gesture_tokens(captured_sequence)
     corrected_words = correct_sentence_with_gemini(words)
 
-    return jsonify({
+    last_capture_result = {
         "sequence": captured_sequence,
         "combined": combined,
         "words": corrected_words,
-        "original_words": words
-    })
+        "original_words": words,
+        "capture_session_id": capture_session_id,
+    }
+    return jsonify(last_capture_result)
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
